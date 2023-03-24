@@ -3,7 +3,7 @@
 import PackageDescription
 
 let package = Package(
-  name: "tinkoff-concurrency",
+  name: "TinkoffConcurrency",
   platforms: [
     .iOS(.v13),
     .macOS(.v10_15),
@@ -17,7 +17,7 @@ let package = Package(
     )
   ],
   dependencies: [
-    .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.0.0")
+    .package(url: "https://github.com/apple/swift-docc-plugin", from: "1.1.0")
   ],
   targets: [
     .target(
