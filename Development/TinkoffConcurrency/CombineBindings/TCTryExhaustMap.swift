@@ -2,21 +2,21 @@ import Combine
 import Foundation
 
 extension Publisher {
-    public func exhaustMap<Result, Context: Scheduler>(
+    public func tryExhaustMap<Result, Context: Scheduler>(
         taskFactory: ITCTaskFactory = TCTaskFactory(),
         scheduler: Context,
-        _ transform: @escaping (Output) async -> Result
-    ) -> Publishers.ExhaustMap<Self, Result> {
-        return Publishers.ExhaustMap(taskFactory: taskFactory, upstream: self, scheduler: scheduler, transform: transform)
+        _ transform: @escaping (Output) async throws -> Result
+    ) -> Publishers.TryExhaustMap<Self, Result> {
+        return Publishers.TryExhaustMap(taskFactory: taskFactory, upstream: self, scheduler: scheduler, transform: transform)
     }
 }
 
 extension Publishers {
-    /// A publisher that transforms all elements from the upstream publisher with
-    /// a provided closure.
-    public struct ExhaustMap<Upstream: Publisher, Output>: Publisher {
+    /// A publisher that transforms all elements from the upstream publisher
+    /// with a provided error-throwing closure.
+    public struct TryExhaustMap<Upstream: Publisher, Output>: Publisher {
 
-        public typealias Failure = Upstream.Failure
+        public typealias Failure = Error
 
         let taskFactory: ITCTaskFactory
 
@@ -25,14 +25,14 @@ extension Publishers {
 
         /// The error-throwing closure that transforms elements from
         /// the upstream publisher.
-        let transform: (Upstream.Output) async -> Output
+        let transform: (Upstream.Output) async throws -> Output
 
         let schedule: (@escaping () -> Void) -> Void
 
         public init<Context: Scheduler>(taskFactory: ITCTaskFactory,
                                         upstream: Upstream,
                                         scheduler: Context,
-                                        transform: @escaping (Upstream.Output) async -> Output)
+                                        transform: @escaping (Upstream.Output) async throws -> Output)
         {
             self.taskFactory = taskFactory
             self.upstream = upstream
@@ -42,21 +42,24 @@ extension Publishers {
     }
 }
 
-extension Publishers.ExhaustMap {
+extension Publishers.TryExhaustMap {
+
     public func receive<Downstream: Subscriber>(subscriber: Downstream)
-        where Output == Downstream.Input, Downstream.Failure == Upstream.Failure
+        where Output == Downstream.Input, Downstream.Failure == Error
     {
         upstream.subscribe(Inner(taskFactory: taskFactory, downstream: subscriber, schedule: schedule, map: transform))
     }
 
+    @available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, *)
     public func exhaustMap<Result, Context: Scheduler>(
         taskFactory: ITCTaskFactory = TCTaskFactory(),
         scheduler: Context,
         _ transform: @escaping (Output) async -> Result
-    ) -> Publishers.ExhaustMap<Upstream, Result> {
-        return .init(taskFactory: taskFactory, upstream: upstream, scheduler: scheduler) { await transform(self.transform($0)) }
+    ) -> Publishers.TryExhaustMap<Upstream, Result> {
+        return .init(taskFactory: taskFactory, upstream: upstream, scheduler: scheduler) { try await transform(self.transform($0)) }
     }
 
+    @available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, *)
     public func tryExhaustMap<Result, Context: Scheduler>(
         taskFactory: ITCTaskFactory = TCTaskFactory(),
         scheduler: Context,
@@ -66,7 +69,7 @@ extension Publishers.ExhaustMap {
     }
 }
 
-extension Publishers.ExhaustMap {
+extension Publishers.TryExhaustMap {
 
     fileprivate final class Inner<Downstream: Subscriber>
         : Subscriber,
@@ -74,7 +77,7 @@ extension Publishers.ExhaustMap {
           CustomStringConvertible,
           CustomReflectable,
           CustomPlaygroundDisplayConvertible
-        where Downstream.Input == Output, Downstream.Failure == Upstream.Failure
+        where Downstream.Input == Output, Downstream.Failure == Error
     {
         typealias Input = Upstream.Output
 
@@ -84,7 +87,7 @@ extension Publishers.ExhaustMap {
 
         private let taskFactory: ITCTaskFactory
 
-        private let map: (Input) async -> Output
+        private let map: (Input) async throws -> Output
 
         private let schedule: (@escaping () -> Void) -> Void
 
@@ -122,6 +125,7 @@ extension Publishers.ExhaustMap {
             case requestDemand(Subscribers.Demand)
             case receiveInput(Input)
             case receiveResult(Output)
+            case receiveError(Error)
             case cancel
             case receiveCompletion(Subscribers.Completion<Failure>)
         }
@@ -135,6 +139,8 @@ extension Publishers.ExhaustMap {
             case sendSubscription
 
             case sendValue(Output)
+
+            case sendError(Error)
 
             case sendCompletion(Subscribers.Completion<Upstream.Failure>)
 
@@ -152,7 +158,7 @@ extension Publishers.ExhaustMap {
         fileprivate init(taskFactory: ITCTaskFactory,
                          downstream: Downstream,
                          schedule: @escaping (@escaping () -> Void) -> Void,
-                         map: @escaping (Input) async -> Output) {
+                         map: @escaping (Input) async throws -> Output) {
             self.downstream = downstream
             self.taskFactory = taskFactory
             self.map = map
@@ -215,6 +221,9 @@ extension Publishers.ExhaustMap {
 
                 case let .cancel(subscription):
                     subscription.cancel()
+
+                case let .sendError(error):
+                    downstream.receive(completion: .failure(error))
 
                 case let .requestValue(subscription):
                     subscription.request(.max(1))
@@ -329,6 +338,11 @@ extension Publishers.ExhaustMap {
                         return [.sendValue(result)]
                     }
 
+                case let .receiveError(error):
+                    state = .completed
+
+                    return [.cancel(subscription), .sendError(error)]
+
                 default:
                     return []
                 }
@@ -346,6 +360,11 @@ extension Publishers.ExhaustMap {
 
                     return [.sendValue(result), .sendCompletion(completion)]
 
+                case let .receiveError(error):
+                    state = .completed
+
+                    return [.cancel(subscription), .sendError(error)]
+
                 default:
                     return []
                 }
@@ -356,14 +375,18 @@ extension Publishers.ExhaustMap {
 
         private func createMapTask(value: Input) -> Task<Void, Never> {
             taskFactory.detached { [weak self, map] in
-                let result = await map(value)
+                do {
+                    let result = try await map(value)
 
-                self?.handle(event: .receiveResult(result))
+                    self?.handle(event: .receiveResult(result))
+                } catch {
+                    self?.handle(event: .receiveError(error))
+                }
             }
         }
     }
 }
-extension Publishers.ExhaustMap.Inner.Action: CustomStringConvertible {
+extension Publishers.TryExhaustMap.Inner.Action: CustomStringConvertible {
 
     // MARK: - Type Methods
 
@@ -374,6 +397,9 @@ extension Publishers.ExhaustMap.Inner.Action: CustomStringConvertible {
 
         case let .sendValue(output):
             return ".sendValue(\(output))"
+
+        case let .sendError(error):
+            return ".sendError(\(error))"
 
         case let .sendCompletion(subscribers_Completion_Upstream_Failure_):
             return ".sendCompletion(\(subscribers_Completion_Upstream_Failure_))"
@@ -390,7 +416,7 @@ extension Publishers.ExhaustMap.Inner.Action: CustomStringConvertible {
     }
 }
 
-extension Publishers.ExhaustMap.Inner.Event: CustomStringConvertible {
+extension Publishers.TryExhaustMap.Inner.Event: CustomStringConvertible {
 
     // MARK: - Type Methods
 
@@ -408,6 +434,9 @@ extension Publishers.ExhaustMap.Inner.Event: CustomStringConvertible {
         case let .receiveResult(output):
             return ".receiveResult(\(output))"
 
+        case let .receiveError(error):
+            return ".receiveError(\(error))"
+
         case .cancel:
             return ".cancel"
 
@@ -420,7 +449,7 @@ extension Publishers.ExhaustMap.Inner.Event: CustomStringConvertible {
     }
 }
 
-extension Publishers.ExhaustMap.Inner.State: CustomStringConvertible {
+extension Publishers.TryExhaustMap.Inner.State: CustomStringConvertible {
 
     // MARK: - Type Methods
 
