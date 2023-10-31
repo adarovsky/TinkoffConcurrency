@@ -3,7 +3,6 @@ import Combine
 @testable import TinkoffConcurrency
 import TinkoffConcurrencyTesting
 
-
 final class TryExhaustMapTests: XCTestCase {
 
     // MARK: - Dependencies
@@ -30,11 +29,12 @@ final class TryExhaustMapTests: XCTestCase {
         // given
         let input = [1, 2, 3, 4, 5].publisher.setFailureType(to: TestError.self)
         var bag = Set<AnyCancellable>()
+        let scheduler = DispatchQueue.test
 
         // when
-        var result: [String] = []
+        let result = UncheckedSendable<[String]>([])
 
-        Publishers.TryExhaustMap(taskFactory: taskFactory, upstream: input) { value in
+        Publishers.TryExhaustMap(taskFactory: taskFactory, upstream: input, scheduler: scheduler) { value in
             "\(value)"
         }.sink { completion in
             switch completion {
@@ -44,24 +44,27 @@ final class TryExhaustMapTests: XCTestCase {
                 XCTFail("Unexpected error received: \(error)")
             }
         } receiveValue: { value in
-            result.append(value)
+            result.mutate { $0.append(value) }
         }.store(in: &bag)
 
         await taskFactory.runUntilIdle()
 
+        await scheduler.run()
+
         // then
-        XCTAssertEqual(result, ["1", "2", "3", "4", "5"])
+        XCTAssertEqual(result.value, ["1", "2", "3", "4", "5"])
     }
 
     func test_tryExhaustMap_extension_values() async {
         // given
         let input = [1, 2, 3, 4, 5].publisher.setFailureType(to: TestError.self)
         var bag = Set<AnyCancellable>()
+        let scheduler = DispatchQueue.test
 
         // when
-        var result: [String] = []
+        let result = UncheckedSendable<[String]>([])
 
-        input.tryExhaustMap(taskFactory: taskFactory) { value in
+        input.tryExhaustMap(taskFactory: taskFactory, scheduler: scheduler) { value in
             "\(value)"
         }.sink { completion in
             switch completion {
@@ -71,13 +74,15 @@ final class TryExhaustMapTests: XCTestCase {
                 XCTFail("Unexpected error received: \(error)")
             }
         } receiveValue: { value in
-            result.append(value)
+            result.mutate { $0.append(value) }
         }.store(in: &bag)
 
         await taskFactory.runUntilIdle()
 
+        await scheduler.run()
+
         // then
-        XCTAssertEqual(result, ["1", "2", "3", "4", "5"])
+        XCTAssertEqual(result.value, ["1", "2", "3", "4", "5"])
     }
 
     func test_tryExhaustMap_subscriptions() async {
@@ -85,13 +90,16 @@ final class TryExhaustMapTests: XCTestCase {
         let input = PublisherMock<Int, TestError>()
         let subscriber1 = SubscriberMock<String, Error>()
         let subscriber2 = SubscriberMock<String, Error>()
-        let publisher = input.tryExhaustMap(taskFactory: taskFactory) { "\($0)" }
+        let scheduler = DispatchQueue.test
+        let publisher = input.tryExhaustMap(taskFactory: taskFactory, scheduler: scheduler) { "\($0)" }
 
         // when
         publisher.subscribe(subscriber1)
         publisher.subscribe(subscriber2)
 
         await taskFactory.runUntilIdle()
+
+        await scheduler.run()
 
         // then
         XCTAssertEqual(input.subscriptions.count, 2)

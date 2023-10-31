@@ -9,11 +9,12 @@ extension Publisher {
         return Publishers.ExhaustMap(taskFactory: taskFactory, upstream: self, transform: transform)
     }
 
-    public func tryExhaustMap<Result>(
+    public func tryExhaustMap<Result, Context: Scheduler>(
         taskFactory: ITCTaskFactory = TCTaskFactory(),
+        scheduler: Context,
         _ transform: @escaping (Output) async throws -> Result
     ) -> Publishers.TryExhaustMap<Self, Result> {
-        return Publishers.TryExhaustMap(taskFactory: taskFactory, upstream: self, transform: transform)
+        return Publishers.TryExhaustMap(taskFactory: taskFactory, upstream: self, scheduler: scheduler, transform: transform)
     }
 }
 
@@ -62,12 +63,17 @@ extension Publishers {
         /// the upstream publisher.
         let transform: (Upstream.Output) async throws -> Output
 
-        public init(taskFactory: ITCTaskFactory,
-                    upstream: Upstream,
-                    transform: @escaping (Upstream.Output) async throws -> Output) {
+        let schedule: (@escaping () -> Void) -> Void
+
+        public init<Context: Scheduler>(taskFactory: ITCTaskFactory,
+                                        upstream: Upstream,
+                                        scheduler: Context,
+                                        transform: @escaping (Upstream.Output) async throws -> Output)
+        {
             self.taskFactory = taskFactory
             self.upstream = upstream
             self.transform = transform
+            self.schedule = scheduler.schedule
         }
     }
 }
@@ -80,11 +86,12 @@ extension Publishers.ExhaustMap {
         return .init(taskFactory: taskFactory, upstream: upstream) { await transform(self.transform($0)) }
     }
 
-    public func tryExhaustMap<Result>(
+    public func tryExhaustMap<Result, Context: Scheduler>(
         taskFactory: ITCTaskFactory = TCTaskFactory(),
+        scheduler: Context,
         _ transform: @escaping (Output) async throws -> Result
     ) -> Publishers.TryExhaustMap<Upstream, Result> {
-        return .init(taskFactory: taskFactory, upstream: upstream) { try await transform(self.transform($0)) }
+        return .init(taskFactory: taskFactory, upstream: upstream, scheduler: scheduler) { try await transform(self.transform($0)) }
     }
 }
 
@@ -93,23 +100,25 @@ extension Publishers.TryExhaustMap {
     public func receive<Downstream: Subscriber>(subscriber: Downstream)
         where Output == Downstream.Input, Downstream.Failure == Error
     {
-        upstream.subscribe(Inner(taskFactory: taskFactory, downstream: subscriber, map: transform))
+        upstream.subscribe(Inner(taskFactory: taskFactory, downstream: subscriber, schedule: schedule, map: transform))
     }
 
     @available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, *)
-    public func exhaustMap<Result>(
+    public func exhaustMap<Result, Context: Scheduler>(
         taskFactory: ITCTaskFactory = TCTaskFactory(),
+        scheduler: Context,
         _ transform: @escaping (Output) async -> Result
     ) -> Publishers.TryExhaustMap<Upstream, Result> {
-        return .init(taskFactory: taskFactory, upstream: upstream) { try await transform(self.transform($0)) }
+        return .init(taskFactory: taskFactory, upstream: upstream, scheduler: scheduler) { try await transform(self.transform($0)) }
     }
 
     @available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, *)
-    public func tryExhaustMap<Result>(
+    public func tryExhaustMap<Result, Context: Scheduler>(
         taskFactory: ITCTaskFactory = TCTaskFactory(),
+        scheduler: Context,
         _ transform: @escaping (Output) async throws -> Result
     ) -> Publishers.TryExhaustMap<Upstream, Result> {
-        return .init(taskFactory: taskFactory, upstream: upstream) { try await transform(self.transform($0)) }
+        return .init(taskFactory: taskFactory, upstream: upstream, scheduler: scheduler) { try await transform(self.transform($0)) }
     }
 }
 
@@ -161,7 +170,7 @@ extension Publishers.TryExhaustMap {
 
 extension Publishers.TryExhaustMap {
 
-    private final class Inner<Downstream: Subscriber>
+    fileprivate final class Inner<Downstream: Subscriber>
         : Subscriber,
           Subscription,
           CustomStringConvertible,
@@ -179,8 +188,10 @@ extension Publishers.TryExhaustMap {
 
         private let map: (Input) async throws -> Output
 
+        private let schedule: (@escaping () -> Void) -> Void
+
         /// Subscriber state.
-        private enum State {
+        fileprivate enum State {
 
             // MARK: - Cases
 
@@ -196,12 +207,15 @@ extension Publishers.TryExhaustMap {
             /// Mapping operation is in progress
             case mapping(from: Subscription, pendingDemand: Subscribers.Demand, mapTask: Task<Void, Never>)
 
+            /// Completion received during mapping
+            case finishing(from: Subscription, mapTask: Task<Void, Never>, pendingCompletion: Subscribers.Completion<Failure>)
+
             /// Cancelled from Combine
             case completed
         }
 
         /// Subscriber event.
-        private enum Event {
+        fileprivate enum Event {
 
             // MARK: - Cases
 
@@ -217,7 +231,7 @@ extension Publishers.TryExhaustMap {
 
         /// Action description. Instead of doing stuff directly, we return descriptions which will be called when state lock is released.
         /// That makes logic more readable.
-        private enum Action {
+        fileprivate enum Action {
 
             // MARK: - Cases
 
@@ -242,10 +256,12 @@ extension Publishers.TryExhaustMap {
 
         fileprivate init(taskFactory: ITCTaskFactory,
                          downstream: Downstream,
+                         schedule: @escaping (@escaping () -> Void) -> Void,
                          map: @escaping (Input) async throws -> Output) {
             self.downstream = downstream
             self.taskFactory = taskFactory
             self.map = map
+            self.schedule = schedule
         }
 
         func receive(subscription: Subscription) {
@@ -281,13 +297,7 @@ extension Publishers.TryExhaustMap {
 
         // MARK: - Private Methods
 
-        private func handle(event: Event) {
-            let oldState = state
-
-            let actions = process(event: event)
-
-            Swift.print("\(event): \(oldState) -> \(state): \(actions)")
-
+        fileprivate func runActions(_ actions: [Action]) {
             for action in actions {
                 switch action {
                 case .sendSubscription:
@@ -320,12 +330,25 @@ extension Publishers.TryExhaustMap {
             }
         }
 
+        private func handle(event: Event) {
+            lock.lock()
+            let oldState = state
+
+            let actions = process(event: event)
+
+            let newState = state
+
+            schedule { [weak self] in
+                self?.runActions(actions)
+            }
+
+            lock.unlock()
+
+            Swift.print("\(event): \(oldState) -> \(newState): \(actions)")
+        }
+
         // swiftlint:disable:next cyclomatic_complexity
         private func process(event: Event) -> [Action] {
-            defer { lock.unlock() }
-
-            lock.lock()
-
             switch state {
             case .waitingForSubscription:
                 switch event {
@@ -396,10 +419,9 @@ extension Publishers.TryExhaustMap {
                     return [.cancel(subscription)]
 
                 case let .receiveCompletion(completion):
-                    mapTask.cancel()
-                    state = .completed
+                    state = .finishing(from: subscription, mapTask: mapTask, pendingCompletion: completion)
 
-                    return [.sendCompletion(completion)]
+                    return []
 
                 case let .requestDemand(newDemand):
                     state = .mapping(from: subscription, pendingDemand: pendingDemand + newDemand, mapTask: mapTask)
@@ -414,6 +436,28 @@ extension Publishers.TryExhaustMap {
                     } else {
                         return [.sendValue(result)]
                     }
+
+                case let .receiveError(error):
+                    state = .completed
+
+                    return [.cancel(subscription), .sendError(error)]
+
+                default:
+                    return []
+                }
+
+            case let .finishing(from: subscription, mapTask: mapTask, pendingCompletion: completion):
+                switch event {
+                case .cancel:
+                    mapTask.cancel()
+                    state = .completed
+
+                    return [.cancel(subscription)]
+
+                case let .receiveResult(result):
+                    state = .completed
+
+                    return [.sendValue(result), .sendCompletion(completion)]
 
                 case let .receiveError(error):
                     state = .completed
@@ -438,6 +482,98 @@ extension Publishers.TryExhaustMap {
                     self?.handle(event: .receiveError(error))
                 }
             }
+        }
+    }
+}
+extension Publishers.TryExhaustMap.Inner.Action: CustomStringConvertible {
+
+    // MARK: - Type Methods
+
+    var description: String {
+        switch self {
+        case .sendSubscription:
+            return ".sendSubscription"
+
+        case let .sendValue(output):
+            return ".sendValue(\(output))"
+
+        case let .sendError(error):
+            return ".sendError(\(error))"
+
+        case let .sendCompletion(subscribers_Completion_Upstream_Failure_):
+            return ".sendCompletion(\(subscribers_Completion_Upstream_Failure_))"
+
+        case let .cancel(subscription):
+            return ".cancel(\(subscription))"
+
+        case let .requestValue(subscription):
+            return ".requestValue(\(subscription))"
+
+        @unknown default:
+            return "<unknown>"
+        }
+    }
+}
+
+extension Publishers.TryExhaustMap.Inner.Event: CustomStringConvertible {
+
+    // MARK: - Type Methods
+
+    var description: String {
+        switch self {
+        case let .receiveSubscription(subscription):
+            return ".receiveSubscription(\(subscription))"
+
+        case let .requestDemand(subscribers_Demand):
+            return ".requestDemand(\(subscribers_Demand))"
+
+        case let .receiveInput(input):
+            return ".receiveInput(\(input))"
+
+        case let .receiveResult(output):
+            return ".receiveResult(\(output))"
+
+        case let .receiveError(error):
+            return ".receiveError(\(error))"
+
+        case .cancel:
+            return ".cancel"
+
+        case let .receiveCompletion(subscribers_Completion_Failure_):
+            return ".receiveCompletion(\(subscribers_Completion_Failure_))"
+
+        @unknown default:
+            return "<unknown>"
+        }
+    }
+}
+
+extension Publishers.TryExhaustMap.Inner.State: CustomStringConvertible {
+
+    // MARK: - Type Methods
+
+    var description: String {
+        switch self {
+        case .waitingForSubscription:
+            return ".waitingForSubscription"
+
+        case let .subscribed(with):
+            return ".subscribed(with: \(with))"
+
+        case let .haveDemand(from, demand):
+            return ".haveDemand(from: \(from), demand: \(demand))"
+
+        case let .mapping(from, pendingDemand, mapTask):
+            return ".mapping(from: \(from), pendingDemand: \(pendingDemand), mapTask: \(mapTask))"
+
+        case let .finishing(from, mapTask, pendingCompletion):
+            return ".finishing(from: \(from), mapTask: \(mapTask), pendingCompletion: \(pendingCompletion))"
+
+        case .completed:
+            return ".completed"
+
+        @unknown default:
+            return "<unknown>"
         }
     }
 }
