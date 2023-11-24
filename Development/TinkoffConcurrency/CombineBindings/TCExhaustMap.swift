@@ -2,12 +2,11 @@ import Combine
 import Foundation
 
 extension Publisher {
-    public func exhaustMap<Result, Context: Scheduler>(
+    public func exhaustMap<Result>(
         taskFactory: ITCTaskFactory = TCTaskFactory(),
-        scheduler: Context,
         _ transform: @escaping (Output) async -> Result
     ) -> Publishers.ExhaustMap<Self, Result> {
-        return Publishers.ExhaustMap(taskFactory: taskFactory, upstream: self, scheduler: scheduler, transform: transform)
+        return Publishers.ExhaustMap(taskFactory: taskFactory, upstream: self, transform: transform)
     }
 }
 
@@ -27,17 +26,13 @@ extension Publishers {
         /// the upstream publisher.
         let transform: (Upstream.Output) async -> Output
 
-        let schedule: (@escaping () -> Void) -> Void
-
-        public init<Context: Scheduler>(taskFactory: ITCTaskFactory,
-                                        upstream: Upstream,
-                                        scheduler: Context,
-                                        transform: @escaping (Upstream.Output) async -> Output)
+        public init(taskFactory: ITCTaskFactory,
+                    upstream: Upstream,
+                    transform: @escaping (Upstream.Output) async -> Output)
         {
             self.taskFactory = taskFactory
             self.upstream = upstream
             self.transform = transform
-            self.schedule = scheduler.schedule
         }
     }
 }
@@ -46,7 +41,7 @@ extension Publishers.ExhaustMap {
     public func receive<Downstream: Subscriber>(subscriber: Downstream)
         where Output == Downstream.Input, Downstream.Failure == Upstream.Failure
     {
-        upstream.subscribe(Inner(taskFactory: taskFactory, downstream: subscriber, schedule: schedule, map: transform))
+        upstream.subscribe(Inner(taskFactory: taskFactory, downstream: subscriber, map: transform))
     }
 
     public func exhaustMap<Result, Context: Scheduler>(
@@ -54,7 +49,7 @@ extension Publishers.ExhaustMap {
         scheduler: Context,
         _ transform: @escaping (Output) async -> Result
     ) -> Publishers.ExhaustMap<Upstream, Result> {
-        return .init(taskFactory: taskFactory, upstream: upstream, scheduler: scheduler) { await transform(self.transform($0)) }
+        return .init(taskFactory: taskFactory, upstream: upstream) { await transform(self.transform($0)) }
     }
 
     public func tryExhaustMap<Result, Context: Scheduler>(
@@ -62,7 +57,7 @@ extension Publishers.ExhaustMap {
         scheduler: Context,
         _ transform: @escaping (Output) async throws -> Result
     ) -> Publishers.TryExhaustMap<Upstream, Result> {
-        return .init(taskFactory: taskFactory, upstream: upstream, scheduler: scheduler) { try await transform(self.transform($0)) }
+        return .init(taskFactory: taskFactory, upstream: upstream) { try await transform(self.transform($0)) }
     }
 }
 
@@ -85,8 +80,6 @@ extension Publishers.ExhaustMap {
         private let taskFactory: ITCTaskFactory
 
         private let map: (Input) async -> Output
-
-        private let schedule: (@escaping () -> Void) -> Void
 
         /// Subscriber state.
         fileprivate enum State {
@@ -132,31 +125,37 @@ extension Publishers.ExhaustMap {
 
             // MARK: - Cases
 
+            case none
+
             case sendSubscription
+
+            case requestValue(Subscription)
 
             case sendValue(Output)
 
             case sendCompletion(Subscribers.Completion<Upstream.Failure>)
 
-            case cancel(Subscription)
+            case sendLastValue(Output, Subscribers.Completion<Upstream.Failure>)
 
-            case requestValue(Subscription)
+            case sendAndRequest(Output, Subscription)
+
+            case cancel(Subscription)
         }
 
         private let lock = NSLock()
 
         private var state: State = .waitingForSubscription
 
+        private var lastTask: Task<Void, Never>?
+
         let combineIdentifier = CombineIdentifier()
 
         fileprivate init(taskFactory: ITCTaskFactory,
                          downstream: Downstream,
-                         schedule: @escaping (@escaping () -> Void) -> Void,
                          map: @escaping (Input) async -> Output) {
             self.downstream = downstream
             self.taskFactory = taskFactory
             self.map = map
-            self.schedule = schedule
         }
 
         func receive(subscription: Subscription) {
@@ -192,19 +191,58 @@ extension Publishers.ExhaustMap {
 
         // MARK: - Private Methods
 
-        fileprivate func runActions(_ actions: [Action]) {
-            for action in actions {
-                switch action {
-                case .sendSubscription:
-                    downstream.receive(subscription: self)
+        private func handle(event: Event) {
+            lock.lock()
 
-                case let .sendValue(value):
+            let action = process(event: event)
+
+            switch action {
+            case .none:
+                lock.unlock()
+
+            case .sendSubscription:
+                lock.unlock()
+                downstream.receive(subscription: self)
+
+            case let .sendValue(value):
+                schedule { [weak self, downstream] in
                     let demand = downstream.receive(value)
                     if demand != .none {
-                        handle(event: .requestDemand(demand))
+                        self?.handle(event: .requestDemand(demand))
+                    }
+                }
+
+                lock.unlock()
+
+            case let .sendCompletion(completion):
+                switch completion {
+                case .finished:
+                    schedule { [downstream] in
+                        downstream.receive(completion: .finished)
                     }
 
-                case let .sendCompletion(completion):
+                case let .failure(error):
+                    schedule { [downstream] in
+                        downstream.receive(completion: .failure(error))
+                    }
+                }
+
+                lock.unlock()
+
+            case let .cancel(subscription):
+                lock.unlock()
+
+                subscription.cancel()
+
+            case let .requestValue(subscription):
+                lock.unlock()
+
+                subscription.request(.max(1))
+
+            case let .sendLastValue(value, completion):
+                schedule { [downstream] in
+                    _ = downstream.receive(value)
+
                     switch completion {
                     case .finished:
                         downstream.receive(completion: .finished)
@@ -212,49 +250,50 @@ extension Publishers.ExhaustMap {
                     case let .failure(error):
                         downstream.receive(completion: .failure(error))
                     }
-
-                case let .cancel(subscription):
-                    subscription.cancel()
-
-                case let .requestValue(subscription):
-                    subscription.request(.max(1))
                 }
+
+                lock.unlock()
+
+            case let .sendAndRequest(value, subscription):
+                schedule { [weak self, downstream] in
+                    let demand = downstream.receive(value)
+                    if demand != .none {
+                        self?.handle(event: .requestDemand(demand))
+                    }
+                }
+
+                lock.unlock()
+
+                subscription.request(.max(1))
             }
         }
 
-        private func handle(event: Event) {
-            lock.lock()
-            let oldState = state
+        private func schedule(operation: @escaping () -> Void) {
+            let previous = lastTask
 
-            let actions = process(event: event)
+            lastTask = taskFactory.detached {
+                await previous?.value
 
-            let newState = state
-
-            schedule { [weak self] in
-                self?.runActions(actions)
+                operation()
             }
-
-            lock.unlock()
-
-            Swift.print("\(event): \(oldState) -> \(newState): \(actions)")
         }
 
         // swiftlint:disable:next cyclomatic_complexity
-        private func process(event: Event) -> [Action] {
+        private func process(event: Event) -> Action {
             switch state {
             case .waitingForSubscription:
                 switch event {
                 case let .receiveSubscription(subscription):
                     state = .subscribed(with: subscription)
 
-                    return [.sendSubscription]
+                    return .sendSubscription
 
                 case .cancel:
                     state = .completed
-                    return []
+                    return .none
 
                 default:
-                    return []
+                    return .none
                 }
 
             case let .subscribed(with: subscription):
@@ -262,44 +301,44 @@ extension Publishers.ExhaustMap {
                 case .cancel:
                     state = .completed
 
-                    return [.cancel(subscription)]
+                    return .cancel(subscription)
 
                 case let .receiveCompletion(completion):
                     state = .completed
 
-                    return [.sendCompletion(completion)]
+                    return .sendCompletion(completion)
 
                 case let .requestDemand(demand):
                     state = .haveDemand(from: subscription, demand: demand)
 
-                    return [.requestValue(subscription)]
+                    return .requestValue(subscription)
 
                 default:
-                    return []
+                    return .none
                 }
 
             case let .haveDemand(from: subscription, demand: demand):
                 switch event {
                 case .cancel:
                     state = .completed
-                    return [.cancel(subscription)]
+                    return .cancel(subscription)
 
                 case let .receiveCompletion(completion):
                     state = .completed
 
-                    return [.sendCompletion(completion)]
+                    return .sendCompletion(completion)
 
                 case let .requestDemand(newDemand):
                     state = .haveDemand(from: subscription, demand: demand + newDemand)
 
-                    return []
+                    return .none
 
                 case let .receiveInput(input):
                     state = .mapping(from: subscription, pendingDemand: demand, mapTask: createMapTask(value: input))
 
-                    return []
+                    return .none
                 default:
-                    return []
+                    return .none
                 }
 
             case let .mapping(from: subscription, pendingDemand: pendingDemand, mapTask: mapTask):
@@ -308,29 +347,29 @@ extension Publishers.ExhaustMap {
                     mapTask.cancel()
                     state = .completed
 
-                    return [.cancel(subscription)]
+                    return .cancel(subscription)
 
                 case let .receiveCompletion(completion):
                     state = .finishing(from: subscription, mapTask: mapTask, pendingCompletion: completion)
 
-                    return []
+                    return .none
 
                 case let .requestDemand(newDemand):
                     state = .mapping(from: subscription, pendingDemand: pendingDemand + newDemand, mapTask: mapTask)
 
-                    return []
+                    return .none
 
                 case let .receiveResult(result):
                     let newDemand = pendingDemand - 1
                     if newDemand != .none {
                         state = .haveDemand(from: subscription, demand: newDemand)
-                        return [.sendValue(result), .requestValue(subscription)]
+                        return .sendAndRequest(result, subscription)
                     } else {
-                        return [.sendValue(result)]
+                        return .sendValue(result)
                     }
 
                 default:
-                    return []
+                    return .none
                 }
 
             case let .finishing(from: subscription, mapTask: mapTask, pendingCompletion: completion):
@@ -339,18 +378,18 @@ extension Publishers.ExhaustMap {
                     mapTask.cancel()
                     state = .completed
 
-                    return [.cancel(subscription)]
+                    return .cancel(subscription)
 
                 case let .receiveResult(result):
                     state = .completed
 
-                    return [.sendValue(result), .sendCompletion(completion)]
+                    return .sendLastValue(result, completion)
 
                 default:
-                    return []
+                    return .none
                 }
             case .completed:
-                return []
+                return .none
             }
         }
 
@@ -362,6 +401,7 @@ extension Publishers.ExhaustMap {
             }
         }
     }
+
 }
 extension Publishers.ExhaustMap.Inner.Action: CustomStringConvertible {
 
@@ -369,8 +409,14 @@ extension Publishers.ExhaustMap.Inner.Action: CustomStringConvertible {
 
     var description: String {
         switch self {
+        case .none:
+            return ".none"
+
         case .sendSubscription:
             return ".sendSubscription"
+
+        case let .requestValue(subscription):
+            return ".requestValue(\(subscription))"
 
         case let .sendValue(output):
             return ".sendValue(\(output))"
@@ -378,14 +424,15 @@ extension Publishers.ExhaustMap.Inner.Action: CustomStringConvertible {
         case let .sendCompletion(subscribers_Completion_Upstream_Failure_):
             return ".sendCompletion(\(subscribers_Completion_Upstream_Failure_))"
 
+        case let .sendLastValue(value0, value1):
+            return ".sendLastValue(\(value0), \(value1))"
+
+        case let .sendAndRequest(value0, value1):
+            return ".sendAndRequest(\(value0), \(value1))"
+
         case let .cancel(subscription):
             return ".cancel(\(subscription))"
 
-        case let .requestValue(subscription):
-            return ".requestValue(\(subscription))"
-
-        @unknown default:
-            return "<unknown>"
         }
     }
 }
@@ -413,9 +460,6 @@ extension Publishers.ExhaustMap.Inner.Event: CustomStringConvertible {
 
         case let .receiveCompletion(subscribers_Completion_Failure_):
             return ".receiveCompletion(\(subscribers_Completion_Failure_))"
-
-        @unknown default:
-            return "<unknown>"
         }
     }
 }
@@ -443,9 +487,6 @@ extension Publishers.ExhaustMap.Inner.State: CustomStringConvertible {
 
         case .completed:
             return ".completed"
-
-        @unknown default:
-            return "<unknown>"
         }
     }
 }

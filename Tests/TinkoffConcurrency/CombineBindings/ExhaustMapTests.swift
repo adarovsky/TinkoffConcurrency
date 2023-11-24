@@ -29,12 +29,11 @@ final class ExhaustMapTests: XCTestCase {
         // given
         let input = [1, 2, 3, 4, 5].publisher
         var bag = Set<AnyCancellable>()
-        let scheduler = DispatchQueue.test
 
         // when
         let result = UncheckedSendable<[String]>([])
 
-        Publishers.ExhaustMap(taskFactory: taskFactory, upstream: input, scheduler: scheduler) { value in
+        Publishers.ExhaustMap(taskFactory: taskFactory, upstream: input) { value in
             "\(value)"
         }.sink { completion in
             switch completion {
@@ -48,8 +47,6 @@ final class ExhaustMapTests: XCTestCase {
         }.store(in: &bag)
 
         await taskFactory.runUntilIdle()
-
-        await scheduler.run()
 
         // then
         XCTAssertEqual(result.value, ["1", "2", "3", "4", "5"])
@@ -59,27 +56,24 @@ final class ExhaustMapTests: XCTestCase {
         // given
         let input = [1, 2, 3, 4, 5].publisher
         var bag = Set<AnyCancellable>()
-        let scheduler = DispatchQueue.test
 
         // when
         let result = UncheckedSendable<[String]>([])
 
-        input.exhaustMap(taskFactory: taskFactory, scheduler: scheduler) { value in
+        input.exhaustMap(taskFactory: taskFactory) { value in
             "\(value)"
         }.sink { completion in
             switch completion {
             case .finished:
                 break
-            case let .failure(error):
-                XCTFail("Unexpected error received: \(error)")
+            case .failure:
+                XCTFail("Unexpected error received")
             }
         } receiveValue: { value in
             result.mutate { $0.append(value) }
         }.store(in: &bag)
 
         await taskFactory.runUntilIdle()
-
-        await scheduler.run()
 
         // then
         XCTAssertEqual(result.value, ["1", "2", "3", "4", "5"])
@@ -90,8 +84,7 @@ final class ExhaustMapTests: XCTestCase {
         let input = PublisherMock<Int, Never>()
         let subscriber1 = SubscriberMock<String, Never>()
         let subscriber2 = SubscriberMock<String, Never>()
-        let scheduler = DispatchQueue.test
-        let publisher = input.exhaustMap(taskFactory: taskFactory, scheduler: scheduler) { "\($0)" }
+        let publisher = input.exhaustMap(taskFactory: taskFactory) { "\($0)" }
 
         // when
         publisher.subscribe(subscriber1)
@@ -99,10 +92,36 @@ final class ExhaustMapTests: XCTestCase {
 
         await taskFactory.runUntilIdle()
 
-        await scheduler.run()
-
         // then
         XCTAssertEqual(input.subscriptions.count, 2)
+    }
+
+    func test_map_subscriptions() async {
+        // given
+        let input = PublisherMock<Int, Never>()
+        let subscriber = SubscriberMock<String, Never>()
+        let publisher = input.map { "\($0)" }
+
+        // when
+        publisher.subscribe(subscriber)
+
+        await taskFactory.runUntilIdle()
+
+        // then
+        XCTAssertEqual(input.subscriptions.count, 1)
+
+        let subscription = input.subscriptions[0]
+
+        XCTAssertEqual(subscription.history, [.requested(.max(1))])
+
+        // when
+        let inputSubscriber = input.subscribers[0]
+
+        let demand = inputSubscriber.receive(1)
+
+        XCTAssertEqual(demand, .max(1))
+
+        XCTAssertEqual(subscription.history, [.requested(.max(1))])
     }
 }
 

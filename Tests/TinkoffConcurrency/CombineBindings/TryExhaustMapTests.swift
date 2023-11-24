@@ -29,12 +29,11 @@ final class TryExhaustMapTests: XCTestCase {
         // given
         let input = [1, 2, 3, 4, 5].publisher.setFailureType(to: TestError.self)
         var bag = Set<AnyCancellable>()
-        let scheduler = DispatchQueue.test
 
         // when
         let result = UncheckedSendable<[String]>([])
 
-        Publishers.TryExhaustMap(taskFactory: taskFactory, upstream: input, scheduler: scheduler) { value in
+        Publishers.TryExhaustMap(taskFactory: taskFactory, upstream: input) { value in
             "\(value)"
         }.sink { completion in
             switch completion {
@@ -48,8 +47,6 @@ final class TryExhaustMapTests: XCTestCase {
         }.store(in: &bag)
 
         await taskFactory.runUntilIdle()
-
-        await scheduler.run()
 
         // then
         XCTAssertEqual(result.value, ["1", "2", "3", "4", "5"])
@@ -59,12 +56,11 @@ final class TryExhaustMapTests: XCTestCase {
         // given
         let input = [1, 2, 3, 4, 5].publisher.setFailureType(to: TestError.self)
         var bag = Set<AnyCancellable>()
-        let scheduler = DispatchQueue.test
 
         // when
         let result = UncheckedSendable<[String]>([])
 
-        input.tryExhaustMap(taskFactory: taskFactory, scheduler: scheduler) { value in
+        input.tryExhaustMap(taskFactory: taskFactory) { value in
             "\(value)"
         }.sink { completion in
             switch completion {
@@ -78,8 +74,6 @@ final class TryExhaustMapTests: XCTestCase {
         }.store(in: &bag)
 
         await taskFactory.runUntilIdle()
-
-        await scheduler.run()
 
         // then
         XCTAssertEqual(result.value, ["1", "2", "3", "4", "5"])
@@ -90,16 +84,13 @@ final class TryExhaustMapTests: XCTestCase {
         let input = PublisherMock<Int, TestError>()
         let subscriber1 = SubscriberMock<String, Error>()
         let subscriber2 = SubscriberMock<String, Error>()
-        let scheduler = DispatchQueue.test
-        let publisher = input.tryExhaustMap(taskFactory: taskFactory, scheduler: scheduler) { "\($0)" }
+        let publisher = input.tryExhaustMap(taskFactory: taskFactory) { "\($0)" }
 
         // when
         publisher.subscribe(subscriber1)
         publisher.subscribe(subscriber2)
 
         await taskFactory.runUntilIdle()
-
-        await scheduler.run()
 
         // then
         XCTAssertEqual(input.subscriptions.count, 2)
